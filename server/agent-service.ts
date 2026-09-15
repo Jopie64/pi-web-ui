@@ -901,6 +901,11 @@ interface Conversation {
 	 *  renders them as pending bubbles in the real message list. */
 	queueSteering: string[];
 	queueFollowUp: string[];
+	/** Unsent composer draft cache (issue #166): mirrors the latest "pi-draft"
+	 *  custom entry of this conversation. Initialized from disk at creation,
+	 *  updated by draft_update / prompt(). Plain "custom" entries never enter
+	 *  agent.state.messages, so drafts stay invisible in the chat view. */
+	draft?: { text: string; ts: number } | null;
 	/** tool_execution_start timestamps keyed by toolCallId — lets tool_status
 	 *  report how long a tool actually ran (vs. waiting on the model). */
 	toolStartTimes: Map<string, number>;
@@ -973,6 +978,43 @@ const TOOL_WATCHDOG_TIMEOUT_MS = (() => {
 const MAX_OPEN_CONVERSATIONS = 8;
 const DEFAULT_CONV_TITLE = "新对话";
 
+/** customType of composer-draft session entries (issue #166). */
+const DRAFT_TYPE = "pi-draft";
+
+/** Latest non-empty-or-empty "pi-draft" custom entry of a session — last one
+ *  wins (same pattern as session_info). null = session has no draft entry. */
+function readLatestDraft(session: AgentSession): { text: string; ts: number } | null {
+	try {
+		const entries = session.sessionManager.getEntries();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const e = entries[i] as unknown as { type?: unknown; customType?: unknown; data?: unknown };
+			if (e.type !== "custom" || e.customType !== DRAFT_TYPE) continue;
+			const d = (e.data ?? {}) as { text?: unknown; ts?: unknown };
+			return { text: typeof d.text === "string" ? d.text : "", ts: typeof d.ts === "number" ? d.ts : 0 };
+		}
+	} catch {
+		// best-effort (inMemory / being-replaced sessions)
+	}
+	return null;
+}
+
+/** Update a conversation's draft: refresh the cache and append a "pi-draft"
+ *  custom entry (append-only; _persist defers file creation until the first
+ *  assistant response, so draft-only chats stay file-less — lazy lifecycle).
+ *  No-op for subagent conversations (inMemory background sessions). */
+function appendDraftEntry(conv: Conversation, text: string): void {
+	if (conv.isSubagent) return;
+	const trimmedSame = (conv.draft?.text ?? "") === text;
+	if (trimmedSame) return; // unchanged — no redundant entry
+	const ts = Date.now();
+	conv.draft = { text, ts };
+	try {
+		conv.session.sessionManager.appendCustomEntry(DRAFT_TYPE, { text, ts });
+	} catch {
+		// best-effort — cache stays authoritative for the snapshot
+	}
+}
+
 /** First user text in a session, truncated for the conversation list. */
 function conversationTitle(session: AgentSession): string {
 	try {
@@ -1009,6 +1051,12 @@ function conversationTitle(session: AgentSession): string {
 	} catch {
 		// best-effort
 	}
+	// Draft-only sessions (no user message yet): fall back to the latest
+	// non-empty "pi-draft" entry so a conversation being composed is
+	// recognizable in the list (issue #166).
+	const d = readLatestDraft(session);
+	const draftText = (d?.text ?? "").trim().replace(/\s+/g, " ");
+	if (draftText) return draftText.length > 30 ? `${draftText.slice(0, 30)}…` : draftText;
 	return DEFAULT_CONV_TITLE;
 }
 
@@ -2229,6 +2277,7 @@ export class ClientSession {
 			lastMessagesArray: [],
 			queueSteering: [],
 			queueFollowUp: [],
+			draft: readLatestDraft(runtime.session),
 			toolStartTimes: new Map(),
 			toolWatchdogs: new Map(),
 		};
@@ -3188,6 +3237,7 @@ export class ClientSession {
 			retry: conv.retryState ?? null,
 			compaction: conv.compactionState ?? null,
 			pendingQuestion: this.pendingQuestionForSnapshot(),
+			draft: conv.isSubagent ? "" : (conv.draft?.text ?? ""),
 			tools: state.tools.map((t) => t.name),
 			version: ++this.version,
 			piConfigured: this.isPiConfigured(),
@@ -4289,6 +4339,29 @@ export class ClientSession {
 		this.emit(msg);
 	}
 
+	/** Store the unsent composer draft of a conversation (issue #166). The
+	 *  client calls this on its ~10s debounce + blur/switch/unload flushes;
+	 *  `conversationId` targets a NON-active conversation (flush on switch —
+	 *  by then the server may already have switched). */
+	async draftUpdate(text: string, conversationId?: string): Promise<void> {
+		const conv = (conversationId ? this.convs.get(conversationId) : undefined) ?? this.convs.get(this.activeId);
+		if (!conv) return;
+		const titleWasDefault = conv.title === DEFAULT_CONV_TITLE;
+		appendDraftEntry(conv, text);
+		// A draft gives a blank conversation a recognizable title (derived from
+		// the draft text — see conversationTitle).
+		if (titleWasDefault && text.trim()) {
+			const t = conversationTitle(conv.session);
+			if (t !== DEFAULT_CONV_TITLE) {
+				conv.title = t;
+				this.emitConversations();
+			}
+		}
+		// Snapshot carries the draft so OTHER tabs sync; the sender's echo is
+		// harmless (client compares against what it last synced).
+		this.flushSnapshot();
+	}
+
 	async prompt(
 		text: string,
 		attachments?: {
@@ -4316,6 +4389,9 @@ export class ClientSession {
 		// switch/new_chat while prompt() is in flight must never target a
 		// different conversation.
 		const conv = this.conv;
+		// Submit = draft consumed (issue #166): append an EMPTY pi-draft entry so
+		// last-wins clears it — the final text lives in the sent prompt itself.
+		appendDraftEntry(conv, "");
 		try {
 			const s = this.session;
 			// Native slash commands (see NATIVE_COMMANDS) are executed here and
@@ -4817,7 +4893,11 @@ export class ClientSession {
 		// this branch normally can't exist — kept as a safety net).
 		const isBlank = (c: Conversation): boolean => {
 			try {
-				return c.session.getSessionStats().totalMessages === 0 && c.terminals.list().length === 0;
+				return (
+					c.session.getSessionStats().totalMessages === 0 &&
+					c.terminals.list().length === 0 &&
+					!(c.draft?.text ?? "").trim() // a draft makes it "not blank" (issue #166)
+				);
 			} catch {
 				// session being replaced — treat as used so we don't switch onto it
 				return false;

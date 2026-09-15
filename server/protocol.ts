@@ -174,6 +174,11 @@ export interface UiState {
 	 *  null / 缺省 = 当前对话没有待答提问。
 	 */
 	pendingQuestion?: UiPendingQuestion | null;
+	/** Unsent composer draft ("pi-draft") of the ACTIVE conversation — latest
+	 *  custom entry wins (same last-wins pattern as session_info). Restored
+	 *  into the composer when the conversation is selected; cleared by the
+	 *  server on prompt(). Empty string = no draft. See issue #166. */
+	draft: string;
 	tools: string[];
 	/** Monotonic snapshot sequence — clients can use it to drop stale snapshots. */
 	version: number;
@@ -309,6 +314,11 @@ export type ClientMessage =
 	 *  prompts. "zh" (zh-CN/…) → Chinese; anything else → English
 	 *  (English default, issue #91). */
 	| { type: "set_locale"; locale: string }
+	/** Unsent composer draft for a conversation (issue #166). Server appends a
+	 *  "pi-draft" custom entry (debounced by the client); `conversationId`
+	 *  targets a NON-active conversation (flush on switch — the active conv
+	 *  is implied when omitted). Subagent conversations ignore it. */
+	| { type: "draft_update"; text: string; conversationId?: string }
 	/** Re-request the slash-command catalog (also pushed on attach / cwd change). */
 	| { type: "get_commands" }
 	| {

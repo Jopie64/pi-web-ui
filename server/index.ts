@@ -744,6 +744,9 @@ export interface DispatchSession {
 	killBackgroundServer(port?: number, taskId?: string): Promise<boolean>;
 	killAllBackgroundServers(): Promise<string[]>;
 	listBgServers(): Promise<void>;
+	/** Unsent composer draft (issue #166) — pi engine only; DSH ignores it
+	 *  (optional method — absent there). */
+	draftUpdate?(text: string, conversationId?: string): Promise<void> | void;
 	/** 返回值语义见 SlashHost.newChat：布尔值 = 是否落在一个可接收首条的空白
 	 *  新对话（/new <prompt> 用）。此处只管转发，返回值被丢弃，故允许 void。
 	 *  preset = DSH Agent 预设（pi 引擎忽略）。 */
@@ -1332,6 +1335,9 @@ wss.on("connection", (ws) => {
 			return;
 		}
 		switch (msg.type) {
+			case "draft_update":
+				void cs.draftUpdate?.(msg.text, msg.conversationId);
+				break;
 			case "prompt":
 				void cs.prompt(msg.text, msg.attachments, msg.queue);
 				break;

@@ -1405,6 +1405,9 @@ export class DshClientSession {
 			permission: conv.permissionPreset ?? null,
 			queue: { steering: conv.queue.steering, followUp: conv.queue.followUp },
 			pendingQuestion: this.pendingQuestionForSnapshot(),
+			// Composer drafts are pi-engine only (issue #166) — DSH sessions have
+			// no session JSONL to store them in, so the field stays empty here.
+			draft: "",
 			tools: [],
 			version: ++this.version,
 			piConfigured: this.isDshConfigured(),

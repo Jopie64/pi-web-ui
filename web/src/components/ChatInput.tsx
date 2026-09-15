@@ -107,6 +107,10 @@ interface ChatInputProps {
 	dshBlank?: boolean;
 	/** 会话 id（dsh 下拉切换会话时重置选中值）。 */
 	conversationId?: string;
+	/** Server-side composer draft (latest "pi-draft" session entry) of the
+	 *  ACTIVE conversation — restored into the composer when untouched
+	 *  (issue #166). Empty string = no draft. */
+	draft?: string;
 }
 
 export const ChatInput = memo(function ChatInput({
@@ -140,6 +144,7 @@ export const ChatInput = memo(function ChatInput({
 	dshPresetDefault,
 	dshBlank,
 	conversationId,
+	draft,
 }: ChatInputProps) {
 	const t = useT();
 	/** 连接/会话就绪：走全局（web/src/app-globals.ts），不再从 App 传。 */
@@ -179,6 +184,74 @@ export const ChatInput = memo(function ChatInput({
 	/** 全局 prompt 历史导航状态（issue #68）：-1 = 未在历史中，>=0 = 历史下标。 */
 	const historyIndexRef = useRef(-1);
 	const draftRef = useRef("");
+
+	// ---- Composer draft persistence (issue #166) ---------------------------
+	/** Per-conversation composer text as last seen locally. */
+	const localTextsRef = useRef(new Map<string, string>());
+	/** Per-conversation text last confirmed sent to the server. */
+	const syncedTextsRef = useRef(new Map<string, string>());
+	const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const convRef = useRef("");
+	/** Send the current per-conv draft when it differs from what was last
+	 *  synced. Safe to call repeatedly (idempotent). */
+	const flushDraft = (convId: string) => {
+		if (draftTimerRef.current) {
+			clearTimeout(draftTimerRef.current);
+			draftTimerRef.current = null;
+		}
+		if (!convId) return;
+		const t = localTextsRef.current.get(convId) ?? "";
+		if (syncedTextsRef.current.get(convId) === t) return;
+		if (appSend({ type: "draft_update", text: t, conversationId: convId })) syncedTextsRef.current.set(convId, t);
+	};
+	// Debounced draft flush on every composer edit — 10s on purpose: appended
+	// draft versions double as autosave history, so the cadence stays coarse.
+	useEffect(() => {
+		if (!conversationId) return;
+		convRef.current = conversationId;
+		localTextsRef.current.set(conversationId, text);
+		if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+		draftTimerRef.current = setTimeout(() => flushDraft(conversationId), 10_000);
+		return () => {
+			if (draftTimerRef.current) {
+				clearTimeout(draftTimerRef.current);
+				draftTimerRef.current = null;
+			}
+		};
+		// eslint-disable-next-line react-hooks/exhaustive-deps -- flushDraft is stable in practice
+	}, [text, conversationId]);
+	// Flush the OUTGOING conversation's draft on switch — the server may have
+	// switched already, so the flush carries the explicit conversation id.
+	useEffect(() => {
+		const prev = convRef.current;
+		convRef.current = conversationId ?? "";
+		if (prev && prev !== convRef.current) flushDraft(prev);
+		// eslint-disable-next-line react-hooks/exhaustive-deps -- flushDraft is stable in practice
+	}, [conversationId]);
+	// Restore the server draft when the composer is untouched: untouched = no
+	// local text for this conversation yet, or identical to what we last sent.
+	useEffect(() => {
+		if (!conversationId) return;
+		const local = localTextsRef.current.get(conversationId);
+		const synced = syncedTextsRef.current.get(conversationId);
+		if (local !== undefined && local !== synced) return; // typed since last sync — keep local
+		const d = draft ?? "";
+		setText(d);
+		localTextsRef.current.set(conversationId, d);
+		syncedTextsRef.current.set(conversationId, d);
+	}, [draft, conversationId]);
+	// Best-effort flush when the tab goes away (a pagehide WS frame usually
+	// makes it out; the 10s debounce bounds the worst-case loss anyway).
+	useEffect(() => {
+		const onLeave = () => flushDraft(convRef.current);
+		window.addEventListener("pagehide", onLeave);
+		window.addEventListener("beforeunload", onLeave);
+		return () => {
+			window.removeEventListener("pagehide", onLeave);
+			window.removeEventListener("beforeunload", onLeave);
+		};
+		// eslint-disable-next-line react-hooks/exhaustive-deps -- flushDraft is stable in practice
+	}, []);
 
 	// 撤回的排队/插队消息 → 按序合并回输入框（空则填入、非空追加，见 composer-draft.ts）。
 	// 用 lastRecallSeqRef 去重：已消费的 seq 不再应用（StrictMode/重复渲染下不会重复追加）；
@@ -1060,6 +1133,7 @@ export const ChatInput = memo(function ChatInput({
 					}}
 					onKeyDown={onKeyDown}
 					onPaste={onPaste}
+					onBlur={() => flushDraft(convRef.current)}
 				/>
 				{/* 底部工具条（ChatGPT 风格）：附件 / 模型 / 思考强度 在左，
 				    发送 / 停止 在右，全部收进输入框容器内。 */}
